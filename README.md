@@ -29,8 +29,13 @@ git clone https://github.com/microsoft/CogACT
 cd CogACT
 pip install -e .
 ```
-If you need to use the traning code, please also install the [Flash Attention](https://github.com/Dao-AILab/flash-attention):
+If you need to use the traning code, please also install the [Flash Attention](https://github.com/Dao-AILab/flash-attention). You can simply run (The first run might take a bit longer):
 ```bash
+pip install -e .[train]
+```
+or install it manually:
+```bash
+# [Optional]
 # Training additionally requires Flash-Attention 2 (https://github.com/Dao-AILab/flash-attention)
 pip install packaging ninja
 

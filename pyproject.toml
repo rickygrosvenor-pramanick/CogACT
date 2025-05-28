@@ -69,6 +69,11 @@ sagemaker = [
     "sagemaker"
 ]
 
+train = [
+    "flash-attn==2.5.5",
+    "ninja",
+    "packaging"
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
