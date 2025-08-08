@@ -15,7 +15,15 @@ Run with:
     - [Single Node Multi-GPU (= $K)]: torchrun --standalone --nnodes 1 --nproc-per-node $K vla-scripts/train.py
 """
 
+# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+#
+# NVIDIA CORPORATION and its licensors retain all intellectual property
+# and proprietary rights in and to this software, related documentation
+# and any modifications thereto.  Any use, reproduction, disclosure or
+# distribution of this software and related documentation without an express
+# license agreement from NVIDIA CORPORATION is strictly prohibited.
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -24,10 +32,11 @@ from typing import Optional, Tuple, Union
 
 import draccus
 import torch
+import torch.backends.cudnn as cudnn
 import torch.distributed as dist
-import yaml
-import wandb
+from torch.utils.data import DataLoader, DistributedSampler
 
+from action_model.action_model import ActionModel
 from prismatic.overwatch import initialize_overwatch
 from prismatic.util import set_global_seed
 from prismatic.vla import get_vla_dataset_and_collator
@@ -40,6 +49,11 @@ from vla import CogACT
 
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+# Keep OpenMP from oversubscribing CPU threads for DataLoader workers
+os.environ.setdefault("OMP_NUM_THREADS", "8")
+os.environ.setdefault("MKL_NUM_THREADS", "8")
+# Enable cuDNN autotuner for convolutional backends
+torch.backends.cudnn.benchmark = True
 
 
 # Initialize Overwatch =>> Wraps `logging.Logger`
@@ -48,6 +62,8 @@ overwatch = initialize_overwatch(__name__)
 
 @dataclass
 class TrainConfig:
+    """The training config."""
+
     # fmt: off
 
     # VLAConfig (`conf/vla.py`); override with --vla.type `VLARegistry.<VLA>.vla_id`
@@ -90,6 +106,29 @@ class TrainConfig:
     action_model_type: str = 'DiT-B'                                # Action model type, chose from ['DiT-S', 'DiT-B', 'DiT-L']
     use_ema: bool = False                                           # EMA version of action model
     action_dim: int = 7                                             # Dimension of action space
+
+    # DataLoader performance knobs
+    per_device_batch_size: int = 16
+    eval_per_device_batch_size: int = 16
+    learning_rate: float = 3e-4
+    lr_scheduler: str = "cosine"
+    weight_decay: float = 0.1
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.95
+    grad_clip_val: float = 1.0
+    warmup_steps: int = 2000
+    max_steps: int = 200000
+    eval_every_n: int = 1000
+    save_every_n: int = 1000
+    log_every_n: int = 10
+    resume_from_checkpoint: Optional[str] = None
+    fsdp_strategy: str = "full_shard"
+    limit_val_batches: int = 50
+    num_workers: int = 8
+    prefetch_factor: int = 4
+    pin_memory: bool = True
+    persistent_workers: bool = True
+    drop_last: bool = True
 
     def __post_init__(self) -> None:
         """Lift optimization parameters from `self.vla` for ease of use =>> validate on `expected_world_size`"""
@@ -221,7 +260,7 @@ def train(cfg: TrainConfig) -> None:
     )
 
     overwatch.info(f"Creating VLA Open-X Dataset with Mixture `{cfg.vla.data_mix}`")
-    vla_dataset, _, collator = get_vla_dataset_and_collator(
+    vla_dataset, collator = get_vla_dataset_and_collator(
         cfg.data_root_dir,
         cfg.vla.data_mix,
         image_transform=vla.vision_backbone.get_image_transform(),
@@ -240,6 +279,33 @@ def train(cfg: TrainConfig) -> None:
         save_dataset_statistics(vla_dataset.dataset_statistics, run_dir)
     
     dist.barrier()
+
+    # Build a performant DataLoader with DistributedSampler when using DDP
+    sampler = (
+        DistributedSampler(vla_dataset, shuffle=True, drop_last=cfg.drop_last)
+        if dist.is_initialized() and not isinstance(vla_dataset, IterableDataset)
+        else None
+    )
+    train_loader = DataLoader(
+        vla_dataset,
+        batch_size=cfg.per_device_batch_size,
+        sampler=sampler,
+        shuffle=(sampler is None),
+        num_workers=cfg.num_workers,
+        prefetch_factor=cfg.prefetch_factor,
+        pin_memory=cfg.pin_memory,
+        persistent_workers=cfg.persistent_workers,
+        collate_fn=collator,
+        worker_init_fn=worker_init_fn,
+        drop_last=cfg.drop_last,
+    )
+    if overwatch.is_rank_zero():
+        overwatch.info(
+            f"DataLoader settings :: world_size={overwatch.world_size()}, "
+            f"num_workers={cfg.num_workers}, prefetch_factor={cfg.prefetch_factor}, "
+            f"pin_memory={cfg.pin_memory}, persistent_workers={cfg.persistent_workers}, drop_last={cfg.drop_last}"
+        )
+
     # Create Train Strategy
     overwatch.info(f"Initializing Train Strategy `{cfg.train_strategy}`")
     train_strategy = get_train_strategy(
@@ -261,6 +327,9 @@ def train(cfg: TrainConfig) -> None:
         reduce_in_full_precision=cfg.vla.reduce_in_full_precision,
         worker_init_fn=worker_init_fn,
     )
+    # Expose optional debug flag to strategy via the VLA instance
+    vla.debug_io = bool(getattr(cfg.vla, "debug_io", False))
+
     train_strategy.run_setup(run_dir=run_dir, n_train_examples=len(vla_dataset))
     if cfg.pretrained_checkpoint is not None and cfg.is_resume:
         train_strategy.load_optimizer_and_scheduler(cfg.pretrained_checkpoint)
@@ -281,7 +350,7 @@ def train(cfg: TrainConfig) -> None:
     # Run VLA Training
     overwatch.info("Starting VLA Training Loop")
     train_strategy.run_vla_training(
-        vla_dataset,
+        train_loader,
         collator,
         metrics,
         save_interval=cfg.save_interval,

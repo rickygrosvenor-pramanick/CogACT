@@ -14,7 +14,7 @@ import numpy as np
 
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Callable, Optional, Union
+from typing import Any, Callable, Optional, Union
 from tqdm import tqdm
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from collections import OrderedDict
@@ -29,7 +29,8 @@ from prismatic.util.batching_utils import SplitModalitySampler
 from prismatic.util.data_utils import PaddedCollatorForActionPrediction, PaddedCollatorForLanguageModeling
 
 from vla import CogACT
-  
+import time
+
 @torch.no_grad()
 def update_ema(ema_model, model, decay=0.9999):
     """
@@ -251,26 +252,33 @@ class TrainingStrategy(ABC):
 
     def run_vla_training(
         self,
-        vla_dataset: IterableDataset,
-        collator: PaddedCollatorForActionPrediction,
+        train_loader: DataLoader,
         metrics: VLAMetrics,
         save_interval: int = 2500,
         save_full_model: bool = True,
         action_model: bool = True,
     ) -> None:
-        """Run the VLA training loop for the given `dataset` and `collator`; log losses, action metrics to `metrics`."""
-        assert isinstance(vla_dataset, IterableDataset), "VLA training expects an IterableDataset!"
-        #assert self.grad_accumulation_steps == 1, "VLA training does not support gradient accumulation!"
+        """Run the VLA training loop.
+        """
+        dataloader = train_loader
+        if overwatch.is_rank_zero():
+            overwatch.info(
+                f"Using DataLoader :: world_size={overwatch.world_size()}, "
+                f"num_workers={getattr(dataloader, 'num_workers', 'n/a')}, pin_memory={getattr(dataloader, 'pin_memory', 'n/a')}"
+            )
 
-        # Create a DataLoader =>> Set `num_workers` to 0; RLDS loader handles parallelism!
-        dataloader = DataLoader(
-            vla_dataset,
-            batch_size=self.per_device_batch_size,
-            sampler=None,
-            collate_fn=collator,
-            num_workers=0,
-            worker_init_fn=self.worker_init_fn,
-        )
+        # Resolve dataset length for epoch calculations when available
+        try:
+            dataset_len = len(getattr(dataloader, 'dataset', dataloader))
+        except Exception:
+            dataset_len = None
+
+        device = torch.device(f"cuda:{self.device_id}") if torch.cuda.is_available() else torch.device("cpu")
+
+        def to_device(batch: Any):
+            if isinstance(batch, dict):
+                return {k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v) for k, v in batch.items()}
+            return batch
 
         # === Train ===
         status = metrics.get_status()
@@ -287,10 +295,17 @@ class TrainingStrategy(ABC):
                 self.vlm.ema_diffusion.eval()
             self.optimizer.zero_grad()
 
+            # Warmup timer over first 200 loader iters (rank 0 only)
+            warmup_start = time.perf_counter()
+            warmup_count = 0
+
             # [Contract] DataLoader wraps RLDS Loader (`.as_numpy_iterator() =>> implicit `.repeat()`)
             #   => This means looping over the DataLoader is basically "infinite" (so no outer loop over epochs).
             #      Slightly breaks default PyTorch semantics, which is why we adaptively compute `epoch` below.
             for train_idx, batch in enumerate(dataloader):
+                # Host->Device non-blocking copies (requires pinned memory)
+                batch = to_device(batch)
+
                 # Note that we'll unpack batch (and let AMP/FSDP do its thing) in the VLM.forward() call
                 #   => Basically, if we're using mixed precision (or not), autocast()/FSDP will move to device!
                 with torch.autocast(
@@ -322,6 +337,13 @@ class TrainingStrategy(ABC):
                 normalized_loss = loss / self.grad_accumulation_steps
                 normalized_loss.backward()
 
+                # Warmup timing after backward to include HtoD + fwd+bwd
+                if getattr(self.vlm, "debug_io", False) and overwatch.is_rank_zero() and warmup_count < 200:
+                    warmup_count += 1
+                    if warmup_count == 200:
+                        elapsed = time.perf_counter() - warmup_start
+                        overwatch.info(f"Warmup: 200 iters took {elapsed:.2f}s (~{elapsed/200:.4f}s/iter)")
+
                 # === Gradient Step ===
                 # Step =>> Only if Done w/ Gradient Accumulation
                 if (train_idx + 1) % self.grad_accumulation_steps == 0:
@@ -335,7 +357,10 @@ class TrainingStrategy(ABC):
                         update_ema(self.vlm.ema_diffusion, self.vlm.action_model)
                     self.optimizer.zero_grad()
                     # Compute epoch value using number of completed gradient steps
-                    epoch = (metrics.global_step + 1) // (len(vla_dataset) // self.global_batch_size)
+                    if dataset_len is not None and dataset_len > 0:
+                        epoch = (metrics.global_step + 1) // (dataset_len // self.global_batch_size)
+                    else:
+                        epoch = 0
 
                     # Push Metrics
                     metrics.commit(update_step_time=True, global_step=metrics.global_step + 1, epoch=epoch, lr=self.lr_scheduler.get_last_lr()[0])
